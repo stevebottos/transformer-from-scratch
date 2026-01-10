@@ -13,17 +13,16 @@ This project is a hands-on journey to build, train, and optimize Transformer mod
 ### Phase 1: Foundations & The Transformer Block
 **Objective:** Build the atomic components of the Transformer architecture.
 
-*   [x] **Step 1: Embeddings
-    *   **Module:** `src/models/embeddings.py` and `src/models/transformer.py`
+*   [x] **Step 1: Embeddings**
+    *   **Module:** `src/models/embeddings.py`
     *   **Tasks:**
         *   Implement `EmbeddingLayer` (wrapper around `nn.Embedding` *scaled by sqrt(d_model)*).
-        *   Implement Positional Encoding as a learnable `nn.Parameter` attribute in the Transformer model (shape: `1, max_seq_len, d_model`).
-    *   **Audit Check:** Verify `pos_embedding` shape is `(1, max_seq_len, d_model)` and that it broadcasts correctly when added to the input embeddings `(Batch, Seq_Len, d_model)`.
+    *   **Audit Check:** Verify output shapes and ensure scaling is applied.
 
-*   [ ] **Step 2: The Heart - Attention Mechanisms**
+*   [x] **Step 2: The Heart - Attention Mechanisms**
     *   **Module:** `src/models/attention.py`
     *   **Tasks:**
-        *   Implement `MultiHeadAttention` from scratch (calculate Q, K, V projections).
+        *   Implement `MultiHeadAttention` from scratch using `einops` for tensor reshaping and transposition (calculate Q, K, V projections).
         *   Implement `scaled_dot_product_attention` manually.
         *   Add masking support (causal mask for decoder, padding mask).
     *   **Audit Check:** Verify output shapes and that causal masking prevents "looking ahead".
@@ -43,9 +42,10 @@ This project is a hands-on journey to build, train, and optimize Transformer mod
     *   **Module:** `src/models/transformer.py`
     *   **Tasks:**
         *   Create `DecoderOnlyTransformer` class.
+        *   Implement Positional Encoding as a learnable `nn.Parameter` attribute (shape: `1, max_seq_len, d_model`).
         *   Stack `DecoderBlock`s.
         *   Add the final projection head to vocabulary size.
-    *   **Audit Check:** Verify parameter count matches expected calculations.
+    *   **Audit Check:** Verify parameter count matches expected calculations. Ensure `pos_embedding` broadcasts correctly during the forward pass.
 
 *   [ ] **Step 5: Data Pipeline & Training Loop**
     *   **Modules:** `src/data/dataset.py`, `src/train.py`
