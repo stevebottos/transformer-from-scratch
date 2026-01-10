@@ -13,7 +13,7 @@ This project is a hands-on journey to build, train, and optimize Transformer mod
 ### Phase 1: Foundations & The Transformer Block
 **Objective:** Build the atomic components of the Transformer architecture.
 
-*   [x] **Step 1: Embeddings & Positional Encoding**
+*   [x] **Step 1: Embeddings
     *   **Module:** `src/models/embeddings.py` and `src/models/transformer.py`
     *   **Tasks:**
         *   Implement `EmbeddingLayer` (wrapper around `nn.Embedding` *scaled by sqrt(d_model)*).
