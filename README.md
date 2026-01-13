@@ -8,6 +8,16 @@ This project is a hands-on journey to build, train, and optimize Transformer mod
 3.  Train on simple datasets (Generation & Seq2Seq).
 4.  Implement inference optimizations (KV-Cache).
 
+## Modernizations
+We are deviating from the 2017 paper defaults to align with modern Large Language Models (LLaMA, PaLM, Mistral):
+*   **RoPE (Rotary Positional Embeddings):** Instead of adding learned vectors to embeddings, we rotate Q and K vectors.
+*   **RMSNorm:** More efficient and stable than LayerNorm.
+*   **SwiGLU:** Gated activation function for the FeedForward block (better performance than ReLU/GELU).
+*   **Pre-Normalization:** Apply Norm *before* the sublayer (Attention/FFN) for training stability.
+    *   *Post-Norm (Original):* `x = Norm(x + Sublayer(x))`. Gradients can explode near output layers, requiring careful warm-up.
+    *   *Pre-Norm (Modern):* `x = x + Sublayer(Norm(x))`. Gradients flow directly through the "residual superhighway" (the `x + ...`), significantly stabilizing deep model training.
+*   **No Biases:** Linear layers and Norms will have `bias=False` to save compute/memory and improve stability.
+
 ## Curriculum & Roadmap
 
 ### Phase 1: Foundations & The Transformer Block
@@ -22,30 +32,31 @@ This project is a hands-on journey to build, train, and optimize Transformer mod
 *   [x] **Step 2: The Heart - Attention Mechanisms**
     *   **Module:** `src/models/attention.py`
     *   **Tasks:**
-        *   Implement `MultiHeadAttention` from scratch using `einops` for tensor reshaping and transposition (calculate Q, K, V projections).
+        *   Implement `MultiHeadAttention` from scratch using `einops`.
+        *   Implement **RoPE** (Rotary Positional Embeddings) to encode position information into Q and K.
         *   Implement `scaled_dot_product_attention` manually.
-        *   Add masking support (causal mask for decoder, padding mask).
+        *   Ensure all Linear projections use `bias=False`.
     *   **Audit Check:** Verify output shapes and that causal masking prevents "looking ahead".
 
-*   [ ] **Step 3: Layers & Normalization**
+*   [x] **Step 3: Layers & Normalization**
     *   **Module:** `src/models/layers.py`
     *   **Tasks:**
-        *   Implement `LayerNormalization` from scratch (optional: or use `nn.LayerNorm` but understand the math).
-        *   Implement `PositionwiseFeedForward` (two linear layers with ReLU/GELU).
-        *   Create the `DecoderBlock` (Self-Attention + Add&Norm + FFN + Add&Norm).
+        *   Implement `RMSNorm` from scratch.
+        *   Implement `SwiGLU` FeedForward block (Gated linear units with Swish activation).
+        *   Create the `DecoderBlock` using **Pre-Norm** architecture (Norm -> Attention -> Add -> Norm -> FFN -> Add).
     *   **Audit Check:** Pass a dummy tensor through a block and verify gradients propagate.
 
 ### Phase 2: Decoder-Only Model (GPT) & Training
 **Objective:** Assemble a GPT-style model and train it to generate text.
 
-*   [ ] **Step 4: Assembling the Decoder-Only Model**
+*   [x] **Step 4: Assembling the Decoder-Only Model**
     *   **Module:** `src/models/transformer.py`
     *   **Tasks:**
         *   Create `DecoderOnlyTransformer` class.
-        *   Implement Positional Encoding as a learnable `nn.Parameter` attribute (shape: `1, max_seq_len, d_model`).
+        *   **Skip** the absolute positional encoding layer (since we use RoPE).
         *   Stack `DecoderBlock`s.
-        *   Add the final projection head to vocabulary size.
-    *   **Audit Check:** Verify parameter count matches expected calculations. Ensure `pos_embedding` broadcasts correctly during the forward pass.
+        *   Add the final projection head (bias=False) to vocabulary size.
+    *   **Audit Check:** Verify parameter count matches expected calculations.
 
 *   [ ] **Step 5: Data Pipeline & Training Loop**
     *   **Modules:** `src/data/dataset.py`, `src/train.py`
@@ -94,5 +105,5 @@ This project is a hands-on journey to build, train, and optimize Transformer mod
 
 ### Specific Concepts
 *   **Learned Positional Encodings**: Used in BERT and GPT models. See [BERT paper](https://arxiv.org/abs/1810.04805).
-*   **Layer Normalization**: [Layer Normalization (2016)](https://arxiv.org/abs/1607.06450).
+*   **RMSNorm**: [Root Mean Square Layer Normalization (2019)](https://arxiv.org/abs/1910.07467).
 *   **KV Cache**: [Efficiently Scaling Transformer Inference](https://arxiv.org/pdf/1911.02150.pdf).

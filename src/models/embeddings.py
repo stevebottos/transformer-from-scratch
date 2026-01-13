@@ -2,31 +2,26 @@
 Step 1: Embeddings
 
 Implement the following:
-1. EmbeddingLayer: 
+1. EmbeddingLayer:
     - A wrapper around nn.Embedding.
-    - Should multiply the output by sqrt(d_model) as per the original paper.
+
+Note: The original transformer paper scaled embeddings by sqrt(d_model) to balance
+magnitudes with sinusoidal positional encodings. With RoPE, positional information
+is applied via rotation in attention rather than addition to embeddings, so this
+scaling is unnecessary. Removing it also simplifies weight tying with lm_head.
 """
 
 import torch
 import torch.nn as nn
-import math
 
 
 class EmbeddingLayer(nn.Module):
     def __init__(self, n_vocab, d_model):
         super().__init__()
         self.embedding_layer = nn.Embedding(n_vocab, d_model)
-        self.scale = math.sqrt(d_model)
 
     def forward(self, tokens):
-        return self.embedding_layer(tokens) * self.scale
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, n_seq, d_model):
-        self.embedding_layer = nn.Embedding(n_seq, d_model)
-
-    def forward(self, x): ...
+        return self.embedding_layer(tokens)
 
 
 if __name__ == "__main__":
