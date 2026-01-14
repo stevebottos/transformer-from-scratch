@@ -1,96 +1,70 @@
-"""
-Step 4 & 7: Transformer Architecture
+"""Decoder-only transformer model."""
 
-Implement the following:
-1. DecoderOnlyTransformer (Step 4):
-    - Stack of DecoderBlocks.
-    - No absolute positional embeddings (RoPE handles this in attention).
-    - Final linear layer to vocabulary size (bias=False).
-2. EncoderDecoderTransformer (Step 7):
-    - Full Transformer including Encoder and Decoder with Cross-Attention.
-"""
-
-import math
 import torch
 import torch.nn as nn
+
 from src.models.layers import DecoderBlock, RMSNorm
 from src.models.embeddings import EmbeddingLayer
 
 
 class DecoderOnlyTransformer(nn.Module):
+    """
+    GPT-style decoder-only transformer.
+
+    Args:
+        d_model: Model dimension.
+        n_vocab: Vocabulary size.
+        n_layers: Number of decoder blocks.
+        n_heads: Number of attention heads.
+        expansion_factor: FFN hidden dim multiplier.
+        dropout: Dropout rate.
+        max_seq_len: Maximum sequence length for RoPE precomputation.
+        rope_theta: RoPE base frequency.
+    """
+
     def __init__(
         self,
-        d_model,
-        n_vocab,
-        n_layers,
-        n_heads,
-        expansion_factor=4,
-        dropout=0.0,
-        max_seq_len=2048,
-        rope_theta=10000.0,
+        d_model: int,
+        n_vocab: int,
+        n_layers: int,
+        n_heads: int,
+        expansion_factor: int = 4,
+        dropout: float = 0.0,
+        max_seq_len: int = 2048,
+        rope_theta: float = 10000.0,
     ):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_layers = n_layers
         self.d_head = d_model // n_heads
-        self.max_seq_len = max_seq_len
 
-        # Precompute RoPE frequencies (cos and sin)
-        freqs_cos, freqs_sin = self.precompute_freqs(self.d_head, max_seq_len, rope_theta)
+        freqs_cos, freqs_sin = self._precompute_freqs(self.d_head, max_seq_len, rope_theta)
         self.register_buffer("freqs_cos", freqs_cos)
         self.register_buffer("freqs_sin", freqs_sin)
 
-        self.embedding_input_layer = EmbeddingLayer(n_vocab=n_vocab, d_model=d_model)
+        self.embedding = EmbeddingLayer(n_vocab, d_model)
         self.embedding_dropout = nn.Dropout(dropout)
-        self.decoder_layers = nn.ModuleList(
-            [
-                DecoderBlock(d_model, n_heads, expansion_factor=expansion_factor, dropout=dropout)
-                for _ in range(n_layers)
-            ]
-        )
-        self.norm_final = RMSNorm(d_model=d_model)
+        self.layers = nn.ModuleList([
+            DecoderBlock(d_model, n_heads, expansion_factor, dropout)
+            for _ in range(n_layers)
+        ])
+        self.norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, n_vocab, bias=False)
-        self.lm_head.weight = self.embedding_input_layer.embedding_layer.weight
+        self.lm_head.weight = self.embedding.embedding_layer.weight  # weight tying
 
         self._init_weights()
 
     @staticmethod
-    def precompute_freqs(dim: int, end: int, theta: float = 10000.0):
-        """
-        Precompute cos and sin for Rotary Positional Embeddings.
-
-        Args:
-            dim: Dimension of the head (d_head).
-            end: Maximum sequence length.
-            theta: Scaling factor (default 10000.0).
-
-        Returns:
-            freqs_cos, freqs_sin: Tensors of shape (end, dim).
-        """
-        # Calculate the 'theta' frequencies
-        # formula: theta_i = 1.0 / (theta ** (2i / dim))
+    def _precompute_freqs(dim: int, seq_len: int, theta: float = 10000.0):
+        """Precompute cos/sin for RoPE."""
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-
-        # Create position indices [0, 1, ..., end-1]
-        t = torch.arange(end, dtype=torch.float32)
-
-        # Outer product to get the frequency for every position
-        # Shape: (end, dim // 2)
-        freqs = torch.outer(t, freqs)
-
-        # Repeat for pairs: (end, dim // 2) -> (end, dim)
-        freqs = freqs.repeat_interleave(2, dim=-1)
-
+        t = torch.arange(seq_len, dtype=torch.float32)
+        freqs = torch.outer(t, freqs).repeat_interleave(2, dim=-1)
         return freqs.cos(), freqs.sin()
 
     def _init_weights(self):
-        """
-        Initialize weights following common practices:
-        - Linear layers: Xavier uniform
-        - Embeddings: Normal with std=0.02
-        - RMSNorm weights: ones (already default)
-        """
+        """Initialize weights: Xavier for linear, normal(0, 0.02) for embeddings."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -102,11 +76,7 @@ class DecoderOnlyTransformer(nn.Module):
         freqs_cos = self.freqs_cos[:seq_len]
         freqs_sin = self.freqs_sin[:seq_len]
 
-        x = self.embedding_input_layer(x)
-        x = self.embedding_dropout(x)
-
-        for layer in self.decoder_layers:
-            x = layer(x, freqs_cos=freqs_cos, freqs_sin=freqs_sin, is_causal=is_causal)
-
-        x = self.norm_final(x)
-        return self.lm_head(x)
+        x = self.embedding_dropout(self.embedding(x))
+        for layer in self.layers:
+            x = layer(x, freqs_cos, freqs_sin, is_causal)
+        return self.lm_head(self.norm(x))

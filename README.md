@@ -1,109 +1,104 @@
-# Transformer From Scratch Curriculum
+# Transformer From Scratch
 
-This project is a hands-on journey to build, train, and optimize Transformer models from first principles using PyTorch.
+A modern decoder-only transformer implementation in PyTorch, trained on WikiText-103.
 
-## Goal
-1.  Write Transformer layers from scratch.
-2.  Implement Decoder-Only (GPT-style) and Encoder-Decoder models.
-3.  Train on simple datasets (Generation & Seq2Seq).
-4.  Implement inference optimizations (KV-Cache).
+## What's Implemented
 
-## Modernizations
-We are deviating from the 2017 paper defaults to align with modern Large Language Models (LLaMA, PaLM, Mistral):
-*   **RoPE (Rotary Positional Embeddings):** Instead of adding learned vectors to embeddings, we rotate Q and K vectors.
-*   **RMSNorm:** More efficient and stable than LayerNorm.
-*   **SwiGLU:** Gated activation function for the FeedForward block (better performance than ReLU/GELU).
-*   **Pre-Normalization:** Apply Norm *before* the sublayer (Attention/FFN) for training stability.
-    *   *Post-Norm (Original):* `x = Norm(x + Sublayer(x))`. Gradients can explode near output layers, requiring careful warm-up.
-    *   *Pre-Norm (Modern):* `x = x + Sublayer(Norm(x))`. Gradients flow directly through the "residual superhighway" (the `x + ...`), significantly stabilizing deep model training.
-*   **No Biases:** Linear layers and Norms will have `bias=False` to save compute/memory and improve stability.
+### Model Architecture (`src/models/`)
 
-## Curriculum & Roadmap
+**Embeddings** (`embeddings.py`)
+- Token embeddings without scaling (scaling unnecessary with RoPE, simplifies weight tying)
 
-### Phase 1: Foundations & The Transformer Block
-**Objective:** Build the atomic components of the Transformer architecture.
+**Attention** (`attention.py`)
+- Multi-head attention with `einops` for tensor manipulation
+- RoPE (Rotary Positional Embeddings) using real-valued sin/cos (compile-friendly, no complex numbers)
+- Switchable backends: manual SDPA or PyTorch's Flash Attention (`use_torch_sdpa=True`)
+- All projections `bias=False`
 
-*   [x] **Step 1: Embeddings**
-    *   **Module:** `src/models/embeddings.py`
-    *   **Tasks:**
-        *   Implement `EmbeddingLayer` (wrapper around `nn.Embedding` *scaled by sqrt(d_model)*).
-    *   **Audit Check:** Verify output shapes and ensure scaling is applied.
+**Layers** (`layers.py`)
+- RMSNorm (more efficient than LayerNorm)
+- SwiGLU feedforward (gated activation, 3 linear layers)
+- DecoderBlock with Pre-Norm architecture: `x + Attn(Norm(x))` then `x + FFN(Norm(x))`
 
-*   [x] **Step 2: The Heart - Attention Mechanisms**
-    *   **Module:** `src/models/attention.py`
-    *   **Tasks:**
-        *   Implement `MultiHeadAttention` from scratch using `einops`.
-        *   Implement **RoPE** (Rotary Positional Embeddings) to encode position information into Q and K.
-        *   Implement `scaled_dot_product_attention` manually.
-        *   Ensure all Linear projections use `bias=False`.
-    *   **Audit Check:** Verify output shapes and that causal masking prevents "looking ahead".
+**Transformer** (`transformer.py`)
+- DecoderOnlyTransformer assembling all components
+- Precomputed RoPE frequencies as buffers
+- Weight tying between embedding and lm_head
+- Xavier init for linears, normal(0, 0.02) for embeddings
 
-*   [x] **Step 3: Layers & Normalization**
-    *   **Module:** `src/models/layers.py`
-    *   **Tasks:**
-        *   Implement `RMSNorm` from scratch.
-        *   Implement `SwiGLU` FeedForward block (Gated linear units with Swish activation).
-        *   Create the `DecoderBlock` using **Pre-Norm** architecture (Norm -> Attention -> Add -> Norm -> FFN -> Add).
-    *   **Audit Check:** Pass a dummy tensor through a block and verify gradients propagate.
+### Training (`train.py`)
 
-### Phase 2: Decoder-Only Model (GPT) & Training
-**Objective:** Assemble a GPT-style model and train it to generate text.
+- Mixed precision training (autocast + GradScaler)
+- AdamW optimizer with weight decay
+- `torch.compile()` for speed
+- Flash Attention verification
+- Checkpointing (saves latest to `checkpoints/latest.pt`)
+- tqdm progress bars
 
-*   [x] **Step 4: Assembling the Decoder-Only Model**
-    *   **Module:** `src/models/transformer.py`
-    *   **Tasks:**
-        *   Create `DecoderOnlyTransformer` class.
-        *   **Skip** the absolute positional encoding layer (since we use RoPE).
-        *   Stack `DecoderBlock`s.
-        *   Add the final projection head (bias=False) to vocabulary size.
-    *   **Audit Check:** Verify parameter count matches expected calculations.
+### Data (`src/data/`)
 
-*   [ ] **Step 5: Data Pipeline & Training Loop**
-    *   **Modules:** `src/data/dataset.py`, `src/train.py`
-    *   **Tasks:**
-        *   Download "Tiny Shakespeare".
-        *   Implement a simple Character-level Tokenizer.
-        *   Create a PyTorch `Dataset` and `DataLoader` for autoregressive tasks (x=tokens[i:i+n], y=tokens[i+1:i+n+1]).
-        *   Write the training loop (CrossEntropyLoss, AdamW).
-    *   **Audit Check:** Overfit a single batch (loss goes to near 0), then train for real and watch loss curve drop.
+- WikiText-103 from HuggingFace (~100M tokens)
+- tiktoken (GPT-2) tokenizer
+- Efficient DataLoader with `num_workers`, `pin_memory`, `persistent_workers`
 
-### Phase 3: Inference & Optimization
-**Objective:** Efficient text generation.
+## Design Decisions
 
-*   [ ] **Step 6: Inference & KV Cache**
-    *   **Module:** `src/inference.py` (or methods in `transformer.py`)
-    *   **Tasks:**
-        *   Implement greedy decoding loop.
-        *   Refactor `MultiHeadAttention` to support **KV Caching** (passing past keys/values to avoid re-computation).
-    *   **Audit Check:** Compare generation speed with and without KV-Cache. Ensure outputs are identical.
+| Decision | Rationale |
+|----------|-----------|
+| No embedding scaling | Original paper scaled by √d_model for sinusoidal pos encodings. RoPE doesn't add to embeddings, so unnecessary. Also simplifies weight tying. |
+| Real-valued RoPE | Complex number ops break `torch.compile()`. Real sin/cos is mathematically identical and compiles. |
+| Pre-Norm | Better gradient flow than Post-Norm, more stable training for deep networks. |
+| `is_causal=True` | More efficient than explicit mask with Flash Attention - uses fused kernel. |
+| No dropout by default | LLaMA-style. Dropout available via parameter if needed. |
+| GPT-2 tokenizer | Large vocab (50k) but well-tested. Trade-off: embedding dominates params for small models. |
 
-### Phase 4: Encoder-Decoder & Seq2Seq
-**Objective:** Full Transformer architecture for translation-style tasks.
+## Scaling Laws
 
-*   [ ] **Step 7: The Encoder & Cross-Attention**
-    *   **Modules:** `src/models/attention.py`, `src/models/transformer.py`
-    *   **Tasks:**
-        *   Add `CrossAttention` logic to your blocks (Decoder attending to Encoder outputs).
-        *   Implement `EncoderBlock` and `Encoder`.
-        *   Assemble `EncoderDecoderTransformer`.
-    *   **Audit Check:** Verify shapes when passing source *and* target sequences.
+WikiText-103 has ~100M tokens. Chinchilla-optimal (tokens/params ≈ 20) suggests ~5M params, but GPT-2's 50k vocab means embeddings alone exceed this. Current setup is overparameterized - use regularization accordingly.
 
-*   [ ] **Step 8: Seq2Seq Training (Toy Task)**
-    *   **Module:** `src/train_seq2seq.py`
-    *   **Tasks:**
-        *   Create a toy dataset (e.g., string reversal: "ABC" -> "CBA", or simple copy task).
-        *   Train the Encoder-Decoder model.
-    *   **Audit Check:** Model successfully performs the algorithmic task on unseen data.
+Run `python scaling_laws.py` to see suggested configurations.
 
-## Resources & References
+## Usage
 
-### Core Reading
-*   **[Attention Is All You Need (2017)](https://arxiv.org/abs/1706.03762)**: The original paper.
-    *   *Read:* Section 3 (Model Architecture).
-*   **[The Illustrated Transformer](https://jalammar.github.io/illustrated-transformer/)**: Essential for visualizing Q, K, V attention flow.
-*   **[The Annotated Transformer](http://nlp.seas.harvard.edu/2018/04/03/attention.html)**: Line-by-line PyTorch implementation guide.
+```bash
+# Install dependencies
+pip install torch einops tiktoken datasets tqdm
 
-### Specific Concepts
-*   **Learned Positional Encodings**: Used in BERT and GPT models. See [BERT paper](https://arxiv.org/abs/1810.04805).
-*   **RMSNorm**: [Root Mean Square Layer Normalization (2019)](https://arxiv.org/abs/1910.07467).
-*   **KV Cache**: [Efficiently Scaling Transformer Inference](https://arxiv.org/pdf/1911.02150.pdf).
+# Train
+python train.py
+
+# Adjust hyperparameters in train.py:
+train(
+    d_model=256,
+    n_layers=6,
+    n_heads=4,
+    seq_len=128,
+    batch_size=64,
+    lr=3e-4,
+    dropout=0.1,
+)
+```
+
+## TODO
+
+- [ ] **Step 6: Inference & KV Cache**
+  - Greedy/sampling decoding loop
+  - KV caching for efficient autoregressive generation
+  - Generation speed benchmarks
+
+- [ ] **Step 7: Encoder & Cross-Attention**
+  - CrossAttention module
+  - EncoderBlock and Encoder stack
+  - EncoderDecoderTransformer
+
+- [ ] **Step 8: Seq2Seq Training**
+  - Toy task dataset (reversal, copy)
+  - Train encoder-decoder model
+
+## References
+
+- [Attention Is All You Need (2017)](https://arxiv.org/abs/1706.03762)
+- [RoFormer: RoPE (2021)](https://arxiv.org/abs/2104.09864)
+- [RMSNorm (2019)](https://arxiv.org/abs/1910.07467)
+- [GLU Variants (2020)](https://arxiv.org/abs/2002.05202)
+- [Chinchilla Scaling Laws (2022)](https://arxiv.org/abs/2203.15556)
