@@ -55,7 +55,7 @@ class DecoderOnlyTransformer(nn.Module):
         self.d_model = d_model
 
     @torch.no_grad()
-    def generate_with_cache(
+    def generate(
         self, tokens: torch.Tensor, max_new_tokens: int, eos_token_id: int | None = None
     ) -> torch.Tensor:
         """
@@ -85,42 +85,6 @@ class DecoderOnlyTransformer(nn.Module):
             next_token_logits = logits[
                 :, -1, :
             ]  # Only need to worry about this during prefill
-
-            # Since the output logits are essentially sim-search across the
-            # embedding corpus, the next token ID is just argmax
-            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-            tokens = torch.hstack([tokens, next_token])
-
-            # TODO 6 (optional but recommended): if eos_token_id is set and
-            # every sequence in the batch has produced it, break early instead
-            # of running all max_new_tokens steps.
-
-        return tokens
-
-    @torch.no_grad()
-    def generate(
-        self, tokens: torch.Tensor, max_new_tokens: int, eos_token_id: int | None = None
-    ) -> torch.Tensor:
-        """
-        Greedy autoregressive generation, no KV cache (recomputes the full
-        sequence every step - O(n^2), fine for now, revisit as a later
-        optimization pass).
-
-        Args:
-            tokens: (B, S) prompt token ids.
-            max_new_tokens: how many tokens to generate after the prompt.
-            eos_token_id: if any sequence in the batch generates this token, stop early.
-        """
-        self.eval()
-        for _ in range(max_new_tokens):
-            if tokens.size(1) == self.max_seq_len:
-                return tokens
-
-            logits, _ = self(tokens, None, 0)
-            # You only care about the prediction for the *next* token,
-            # which comes from the last position in the sequence dim.
-            # Slice down (B, S, n_vocab) -> (B, n_vocab).
-            next_token_logits = logits[:, -1, :]
 
             # Since the output logits are essentially sim-search across the
             # embedding corpus, the next token ID is just argmax
