@@ -56,6 +56,7 @@ class MultiHeadAttention(nn.Module):
 
         qkv: torch.Tensor = self.W_qkv(x)
         q, k, v = qkv.chunk(3, -1)
+
         if cache is not None:
             k = torch.cat((cache[0], k), dim=1)
             v = torch.cat((cache[1], v), dim=1)
@@ -69,15 +70,16 @@ class MultiHeadAttention(nn.Module):
         _v = v.view(bkv, skv, self.n_heads, self.d_heads).transpose(1, 2)
 
         context = self.sdpa(q, _k, _v, mask)
-
-        # `view` just relabels the flat memory buffer, rightmost dim fastest. Right
-        # now memory order is (B, n_heads, S, d_head), so S ticks over before
-        # n_heads. view(B, S, D) would instead grab D consecutive elements as one
-        # "token" - but that's head0/seq0 + head0/seq1, not head0/seq0 + head1/seq0.
-        # Same shape, wrong grouping. transpose(1, 2) puts n_heads before d_head
-        # within a fixed seq position (matching what view(B, S, D) needs), but only
-        # reorders strides - .contiguous() does the actual copy so view is safe.
-        context = context.transpose(2, 1).contiguous().view(bq, sq, dq)
+        # view/reshape merges dims by reading the flat buffer in memory order
+        # (rightmost fastest), blind to what the dims mean. Right now memory
+        # order is (B, n_heads, S, d_head) - for a fixed seq position, its
+        # d_head values are scattered across separate head-blocks, not adjacent.
+        # Merging (n_heads, d_head) -> D straight from this layout would grab
+        # e.g. head0/seq0 + head0/seq1 as one "token" instead of head0/seq0 +
+        # head1/seq0. transpose(1, 2) reorders to (B, S, n_heads, d_head) so
+        # each position's heads are contiguous before the merge (reshape
+        # instead of .contiguous().view(..) since transpose breaks contiguity).
+        context = context.transpose(2, 1).reshape(bq, sq, dq)
         return self.dropout(self.W_o(context)), k, v
 
 

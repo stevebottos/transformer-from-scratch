@@ -71,21 +71,21 @@ class DecoderOnlyTransformer(nn.Module):
         self.eval()
 
         cache = [None] * len(self.layers)
+        pos_in_sequence = 0
         for _ in range(max_new_tokens):
-            # Sliding window max_seq_len long
-            tokens_cropped = tokens[:, -self.max_seq_len :]
+            if tokens.size(1) == self.max_seq_len:
+                return tokens
 
             if cache[0] is not None:
-                print("A", tokens_cropped.shape)
-                model_input = tokens_cropped[:, -1:]
+                model_input = tokens[:, -1:]
             else:
-                model_input = tokens_cropped
+                model_input = tokens
 
-            logits = self(model_input, cache)
-            # TODO 3: you only care about the prediction for the *next* token,
-            # which comes from the last position in the sequence dim.
-            # Slice down (B, S, n_vocab) -> (B, n_vocab).
-            next_token_logits = logits[:, -1, :]
+            logits, pos_in_sequence = self(model_input, cache, pos_in_sequence)
+            next_token_logits = logits[
+                :, -1, :
+            ]  # Only need to worry about this during prefill
+
             # Since the output logits are essentially sim-search across the
             # embedding corpus, the next token ID is just argmax
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
@@ -112,16 +112,16 @@ class DecoderOnlyTransformer(nn.Module):
             eos_token_id: if any sequence in the batch generates this token, stop early.
         """
         self.eval()
-
         for _ in range(max_new_tokens):
-            # Sliding window max_seq_len long
-            tokens_cropped = tokens[:, -self.max_seq_len :]
+            if tokens.size(1) == self.max_seq_len:
+                return tokens
 
-            logits = self(tokens_cropped)
-            # TODO 3: you only care about the prediction for the *next* token,
+            logits, _ = self(tokens, None, 0)
+            # You only care about the prediction for the *next* token,
             # which comes from the last position in the sequence dim.
             # Slice down (B, S, n_vocab) -> (B, n_vocab).
             next_token_logits = logits[:, -1, :]
+
             # Since the output logits are essentially sim-search across the
             # embedding corpus, the next token ID is just argmax
             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
@@ -133,32 +133,34 @@ class DecoderOnlyTransformer(nn.Module):
 
         return tokens
 
-    def forward(self, tokens, cache: list | None = None):
+    def forward(self, tokens, cache: list | None = None, pos_in_sequence: int = 0):
         x = self.embedding_layer(tokens)
         B, S, D = x.shape
         # scale input only since we are weight tying
         x = x / math.sqrt(D)
 
-        positions = torch.arange(S, device=x.device)
-        x = x + self.pos_embed(positions)
+        if pos_in_sequence == 0:
+            positions = torch.arange(pos_in_sequence, S, device=x.device)
+            x = x + self.pos_embed(positions)
+            pos_in_sequence = (
+                S  # The index we're at after prefill, read in this token next
+            )
+        else:
+            x = x + self.pos_embed(torch.tensor(pos_in_sequence, device=tokens.device))
+            pos_in_sequence += 1
 
         use_cache = isinstance(cache, list)
         for i, layer in enumerate(self.layers):
             if use_cache:
                 layer_cache = cache[i]
                 x, k, v = layer(x, layer_cache)
-
-                # prefill
-                if layer_cache is None:
-                    cache[i] = (k, v)
-                else:
-                    ...
+                cache[i] = [k, v]
             else:
-                x, _ = layer(x, None)
+                x, _, _ = layer(x, None)
 
         # we're weight tying here. On input, idx -> embedding lookup.
         # At this point (output), the mental model is "simlilarity search"
         # like you'd have in a vector db. embedding -> lm_head -> logits are
         # most probable next tokens
         # This ends up shape (B, S, n_vocab)
-        return self.lm_head(self.norm(x))
+        return self.lm_head(self.norm(x)), pos_in_sequence
