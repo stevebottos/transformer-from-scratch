@@ -2,55 +2,23 @@
 
 A modern decoder-only transformer implementation in PyTorch, trained on WikiText-103.
 
-## What's Implemented
+## What's In / What's Out
 
-### Model Architecture (`src/models/`)
+Decoder-only, modern-style, but not chasing every LLaMA feature.
 
-**Embeddings** (`embeddings.py`)
-- Token embeddings without scaling (scaling unnecessary with RoPE, simplifies weight tying)
-
-**Attention** (`attention.py`)
-- Multi-head attention with `einops` for tensor manipulation
-- RoPE (Rotary Positional Embeddings) using real-valued sin/cos (compile-friendly, no complex numbers)
-- Switchable backends: manual SDPA or PyTorch's Flash Attention (`use_torch_sdpa=True`)
-- All projections `bias=False`
-
-**Layers** (`layers.py`)
-- RMSNorm (more efficient than LayerNorm)
-- SwiGLU feedforward (gated activation, 3 linear layers)
-- DecoderBlock with Pre-Norm architecture: `x + Attn(Norm(x))` then `x + FFN(Norm(x))`
-
-**Transformer** (`transformer.py`)
-- DecoderOnlyTransformer assembling all components
-- Precomputed RoPE frequencies as buffers
+**In**
+- Pre-Norm: `x + Attn(Norm(x))`, `x + FFN(Norm(x))`
+- RMSNorm instead of LayerNorm
+- SwiGLU feedforward
+- `bias=False` on all linear projections (norm already gives a shift term; matches modern practice, not the 2017 paper)
 - Weight tying between embedding and lm_head
-- Xavier init for linears, normal(0, 0.02) for embeddings
+- GPT-2 (tiktoken) tokenizer
+- Mixed precision + `torch.compile()` training, AdamW
 
-### Training (`train.py`)
-
-- Mixed precision training (autocast + GradScaler)
-- AdamW optimizer with weight decay
-- `torch.compile()` for speed
-- Flash Attention verification
-- Checkpointing (saves latest to `checkpoints/latest.pt`)
-- tqdm progress bars
-
-### Data (`src/data/`)
-
-- WikiText-103 from HuggingFace (~100M tokens)
-- tiktoken (GPT-2) tokenizer
-- Efficient DataLoader with `num_workers`, `pin_memory`, `persistent_workers`
-
-## Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| No embedding scaling | Original paper scaled by √d_model for sinusoidal pos encodings. RoPE doesn't add to embeddings, so unnecessary. Also simplifies weight tying. |
-| Real-valued RoPE | Complex number ops break `torch.compile()`. Real sin/cos is mathematically identical and compiles. |
-| Pre-Norm | Better gradient flow than Post-Norm, more stable training for deep networks. |
-| `is_causal=True` | More efficient than explicit mask with Flash Attention - uses fused kernel. |
-| No dropout by default | LLaMA-style. Dropout available via parameter if needed. |
-| GPT-2 tokenizer | Large vocab (50k) but well-tested. Trade-off: embedding dominates params for small models. |
+**Out (for now)**
+- RoPE - skipped, using learned/absolute positions instead. Revisit if extrapolation to longer contexts matters.
+- KV cache / efficient inference - see TODO
+- Encoder / cross-attention - see TODO
 
 ## Scaling Laws
 

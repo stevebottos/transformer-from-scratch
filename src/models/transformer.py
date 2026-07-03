@@ -1,25 +1,16 @@
 """Decoder-only transformer model."""
 
+from dataclasses import dataclass
+import math
 import torch
 import torch.nn as nn
 
-from src.models.layers import DecoderBlock, RMSNorm
-from src.models.embeddings import EmbeddingLayer
+from src.layers.attention import DecoderLayer, RMSNorm
 
 
 class DecoderOnlyTransformer(nn.Module):
     """
     GPT-style decoder-only transformer.
-
-    Args:
-        d_model: Model dimension.
-        n_vocab: Vocabulary size.
-        n_layers: Number of decoder blocks.
-        n_heads: Number of attention heads.
-        expansion_factor: FFN hidden dim multiplier.
-        dropout: Dropout rate.
-        max_seq_len: Maximum sequence length for RoPE precomputation.
-        rope_theta: RoPE base frequency.
     """
 
     def __init__(
@@ -28,55 +19,146 @@ class DecoderOnlyTransformer(nn.Module):
         n_vocab: int,
         n_layers: int,
         n_heads: int,
-        expansion_factor: int = 4,
+        ff_expansion: int = 4,
         dropout: float = 0.0,
         max_seq_len: int = 2048,
-        rope_theta: float = 10000.0,
     ):
         super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.d_head = d_model // n_heads
 
-        freqs_cos, freqs_sin = self._precompute_freqs(self.d_head, max_seq_len, rope_theta)
-        self.register_buffer("freqs_cos", freqs_cos)
-        self.register_buffer("freqs_sin", freqs_sin)
+        self.embedding_layer = nn.Embedding(
+            num_embeddings=n_vocab,
+            embedding_dim=d_model,
+        )
+        self.pos_embed = nn.Embedding(
+            num_embeddings=max_seq_len,
+            embedding_dim=d_model,
+        )
 
-        self.embedding = EmbeddingLayer(n_vocab, d_model)
-        self.embedding_dropout = nn.Dropout(dropout)
-        self.layers = nn.ModuleList([
-            DecoderBlock(d_model, n_heads, expansion_factor, dropout)
-            for _ in range(n_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                DecoderLayer(
+                    d_model,
+                    n_heads,
+                    ff_expansion,
+                    dropout,
+                )
+                for _ in range(n_layers)
+            ]
+        )
         self.norm = RMSNorm(d_model)
-        self.lm_head = nn.Linear(d_model, n_vocab, bias=False)
-        self.lm_head.weight = self.embedding.embedding_layer.weight  # weight tying
 
-        self._init_weights()
+        # Weight tie
+        self.lm_head = torch.nn.Linear(d_model, n_vocab, bias=False)
+        self.lm_head.weight = self.embedding_layer.weight
 
-    @staticmethod
-    def _precompute_freqs(dim: int, seq_len: int, theta: float = 10000.0):
-        """Precompute cos/sin for RoPE."""
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        t = torch.arange(seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, freqs).repeat_interleave(2, dim=-1)
-        return freqs.cos(), freqs.sin()
+        self.max_seq_len = max_seq_len
+        self.d_model = d_model
 
-    def _init_weights(self):
-        """Initialize weights: Xavier for linear, normal(0, 0.02) for embeddings."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    @torch.no_grad()
+    def generate_with_cache(
+        self, tokens: torch.Tensor, max_new_tokens: int, eos_token_id: int | None = None
+    ) -> torch.Tensor:
+        """
+        Greedy autoregressive generation, no KV cache (recomputes the full
+        sequence every step - O(n^2), fine for now, revisit as a later
+        optimization pass).
 
-    def forward(self, x, is_causal=True):
-        seq_len = x.shape[1]
-        freqs_cos = self.freqs_cos[:seq_len]
-        freqs_sin = self.freqs_sin[:seq_len]
+        Args:
+            tokens: (B, S) prompt token ids.
+            max_new_tokens: how many tokens to generate after the prompt.
+            eos_token_id: if any sequence in the batch generates this token, stop early.
+        """
+        self.eval()
 
-        x = self.embedding_dropout(self.embedding(x))
-        for layer in self.layers:
-            x = layer(x, freqs_cos, freqs_sin, is_causal)
+        cache = [None] * len(self.layers)
+        for _ in range(max_new_tokens):
+            # Sliding window max_seq_len long
+            tokens_cropped = tokens[:, -self.max_seq_len :]
+
+            if cache[0] is not None:
+                print("A", tokens_cropped.shape)
+                model_input = tokens_cropped[:, -1:]
+            else:
+                model_input = tokens_cropped
+
+            logits = self(model_input, cache)
+            # TODO 3: you only care about the prediction for the *next* token,
+            # which comes from the last position in the sequence dim.
+            # Slice down (B, S, n_vocab) -> (B, n_vocab).
+            next_token_logits = logits[:, -1, :]
+            # Since the output logits are essentially sim-search across the
+            # embedding corpus, the next token ID is just argmax
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            tokens = torch.hstack([tokens, next_token])
+
+            # TODO 6 (optional but recommended): if eos_token_id is set and
+            # every sequence in the batch has produced it, break early instead
+            # of running all max_new_tokens steps.
+
+        return tokens
+
+    @torch.no_grad()
+    def generate(
+        self, tokens: torch.Tensor, max_new_tokens: int, eos_token_id: int | None = None
+    ) -> torch.Tensor:
+        """
+        Greedy autoregressive generation, no KV cache (recomputes the full
+        sequence every step - O(n^2), fine for now, revisit as a later
+        optimization pass).
+
+        Args:
+            tokens: (B, S) prompt token ids.
+            max_new_tokens: how many tokens to generate after the prompt.
+            eos_token_id: if any sequence in the batch generates this token, stop early.
+        """
+        self.eval()
+
+        for _ in range(max_new_tokens):
+            # Sliding window max_seq_len long
+            tokens_cropped = tokens[:, -self.max_seq_len :]
+
+            logits = self(tokens_cropped)
+            # TODO 3: you only care about the prediction for the *next* token,
+            # which comes from the last position in the sequence dim.
+            # Slice down (B, S, n_vocab) -> (B, n_vocab).
+            next_token_logits = logits[:, -1, :]
+            # Since the output logits are essentially sim-search across the
+            # embedding corpus, the next token ID is just argmax
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            tokens = torch.hstack([tokens, next_token])
+
+            # TODO 6 (optional but recommended): if eos_token_id is set and
+            # every sequence in the batch has produced it, break early instead
+            # of running all max_new_tokens steps.
+
+        return tokens
+
+    def forward(self, tokens, cache: list | None = None):
+        x = self.embedding_layer(tokens)
+        B, S, D = x.shape
+        # scale input only since we are weight tying
+        x = x / math.sqrt(D)
+
+        positions = torch.arange(S, device=x.device)
+        x = x + self.pos_embed(positions)
+
+        use_cache = isinstance(cache, list)
+        for i, layer in enumerate(self.layers):
+            if use_cache:
+                layer_cache = cache[i]
+                x, k, v = layer(x, layer_cache)
+
+                # prefill
+                if layer_cache is None:
+                    cache[i] = (k, v)
+                else:
+                    ...
+            else:
+                x, _ = layer(x, None)
+
+        # we're weight tying here. On input, idx -> embedding lookup.
+        # At this point (output), the mental model is "simlilarity search"
+        # like you'd have in a vector db. embedding -> lm_head -> logits are
+        # most probable next tokens
+        # This ends up shape (B, S, n_vocab)
         return self.lm_head(self.norm(x))
