@@ -7,23 +7,38 @@ from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from src.data import create_dataloaders
-from src.models.transformer import DecoderOnlyTransformer
+from src.transformer import DecoderOnlyTransformer
 
 CHECKPOINT_DIR = Path("checkpoints")
 
 
-def save_checkpoint(model, optimizer, scaler, epoch, step, val_loss, config):
+def save_checkpoint(model, optimizer, scaler, step, val_loss, config, ckpt_path):
     """Save model checkpoint."""
     CHECKPOINT_DIR.mkdir(exist_ok=True)
-    torch.save({
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
-        "epoch": epoch,
-        "step": step,
-        "val_loss": val_loss,
-        "config": config,
-    }, CHECKPOINT_DIR / "latest.pt")
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "step": step,
+            "val_loss": val_loss,
+            "config": config,
+        },
+        ckpt_path,
+    )
+
+
+@torch.no_grad()
+def generate_sample(
+    model, val_loader, tokenizer, device, prompt_len=10, max_new_tokens=30
+):
+    """Greedily generate from a validation prompt, for eyeballing progress."""
+    model.eval()
+    x, _ = next(iter(val_loader))
+    prompt = x[:1, :prompt_len].to(device)
+    out = model.generate(prompt, max_new_tokens=max_new_tokens)
+    model.train()
+    return tokenizer.decode(out[0].tolist())
 
 
 @torch.no_grad()
@@ -34,28 +49,41 @@ def evaluate(model, val_loader, device):
     for x, y in val_loader:
         x, y = x.to(device), y.to(device)
         with autocast("cuda"):
-            logits = model(x)
-            loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            logits, _, _ = model(x)
+            loss = nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)), y.view(-1)
+            )
         total_loss += loss.item()
     return total_loss / len(val_loader)
 
 
+# Same backbone (d_model/n_layers/n_heads) and same per-expert FFN size as
+# dense's ff_expansion, so active compute/token is identical between the two.
+# MoE's extra experts add total capacity (params) for free at inference time,
+# which is the whole point of MoE - not something to cancel out.
+DENSE_CONFIG = dict(ff_expansion=4, n_experts=None)
+MOE_CONFIG = dict(ff_expansion=4, n_experts=8)
+
+
 def train(
-    d_model: int = 128,
-    n_layers: int = 4,
+    d_model: int = 256,
+    n_layers: int = 6,
     n_heads: int = 8,
     seq_len: int = 128,
     batch_size: int = 64,
     lr: float = 3e-4,
     weight_decay: float = 0.1,
-    epochs: int = 10,
+    max_steps: int = 500000,
     dropout: float = 0.1,
     eval_interval: int = 5000,
     device: str = "cuda",
+    moe: bool = False,
+    aux_loss_weight: float = 0.01,
 ):
     """Train the model."""
     config = dict(locals())
     device = torch.device(device if torch.cuda.is_available() else "cpu")
+    model_config = MOE_CONFIG if moe else DENSE_CONFIG
 
     train_loader, val_loader, tokenizer = create_dataloaders(seq_len, batch_size)
 
@@ -66,50 +94,88 @@ def train(
         n_heads=n_heads,
         dropout=dropout,
         max_seq_len=seq_len,
+        **model_config,
     ).to(device)
 
-    print(f"Device: {device} | Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(
+        f"Device: {device} | Parameters: {sum(p.numel() for p in model.parameters()):,}"
+    )
 
-    model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler = GradScaler("cuda")
 
-    step = 0
+    start_step = 0
     best_val_loss = float("inf")
+    val_loss = 0
+    ckpt_path = CHECKPOINT_DIR / ("latest_moe.pt" if moe else "latest_dense.pt")
+    if ckpt_path.exists():
+        print(f"Resuming from {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_step = ckpt["step"]
+        best_val_loss = val_loss = ckpt["val_loss"]
 
-    for epoch in range(epochs):
-        model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}")
+    # Compile after loading weights - the compiled wrapper's state_dict keys
+    # don't cleanly match the raw module's, easier to load into the raw
+    # module first.
+    model = torch.compile(model)
 
-        for x, y in pbar:
-            x, y = x.to(device), y.to(device)
+    model.train()
+    pbar = tqdm(total=max_steps, initial=start_step, desc="Training")
+    train_iter = iter(train_loader)
+    for step in range(start_step, max_steps):
+        try:
+            x, y = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            x, y = next(train_iter)
+        x, y = x.to(device), y.to(device)
 
-            optimizer.zero_grad()
-            with autocast("cuda"):
-                logits = model(x)
-                loss = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        optimizer.zero_grad()
+        with autocast("cuda"):
+            logits, _, aux_loss = model(x)
+            loss = nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)), y.view(-1)
+            )
+            if aux_loss is not None:
+                loss = loss + aux_loss_weight * aux_loss
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        pbar.update(1)
 
-            if step % eval_interval == 0 and step > 0:
-                val_loss = evaluate(model, val_loader, device)
-                pbar.set_postfix(loss=f"{loss.item():.4f}", val=f"{val_loss:.4f}")
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    save_checkpoint(model, optimizer, scaler, epoch, step, val_loss, config)
+        # if step % eval_interval == 0 and step > 0:
+        #     val_loss = evaluate(model, val_loader, device)
+        #     model.train()
+        #     pbar.set_postfix(loss=f"{loss.item():.4f}", val=f"{val_loss:.4f}")
+        #     if val_loss < best_val_loss:
+        #         best_val_loss = val_loss
+        #         save_checkpoint(model, optimizer, scaler, step, val_loss, config)
 
-            step += 1
+        if step % 1000 == 0 and step > 0:
+            sample = generate_sample(model, val_loader, tokenizer, device)
+            tqdm.write(f"[step {step}] sample: {sample!r}")
 
-        val_loss = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch + 1}/{epochs} | Val Loss: {val_loss:.4f}")
-        save_checkpoint(model, optimizer, scaler, epoch, step, val_loss, config)
+            save_checkpoint(
+                model, optimizer, scaler, max_steps, val_loss, config, ckpt_path
+            )
+
+    # val_loss = evaluate(model, val_loader, device)
+    print(f"Final | Val Loss: {val_loss:.4f}")
+    save_checkpoint(model, optimizer, scaler, max_steps, val_loss, config)
 
     return model, tokenizer
 
 
 if __name__ == "__main__":
-    train()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--moe", action="store_true")
+    args = parser.parse_args()
+    train(moe=args.moe)
