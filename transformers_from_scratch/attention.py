@@ -39,54 +39,54 @@ class MultiHeadAttention(nn.Module):
         if not d_model % n_heads == 0:
             raise ValueError("d_model must be divisible by n_heads.")
 
-        # TODO(GQA): n_kv_heads=None should fall back to n_heads (plain MHA,
-        # today's behavior). Otherwise n_heads must be divisible by
-        # n_kv_heads - n_heads // n_kv_heads query heads share each K/V head.
-        self.n_heads = n_heads
-        self.d_heads = d_model // n_heads
+        if n_kv_heads:
+            if not n_heads % n_kv_heads == 0:
+                raise ValueError("n_heads must be divisible by n_kv_heads.")
 
-        # This is more efficient on GPU than a separate layer for q,k,v
-        # because it's one GEMM (GEneral Matrix Multiply instead of three.
-        # Each nn.Linear call is one GEMM launch
-        # TODO(GQA): K/V only need n_kv_heads * d_heads each, not d_model each -
-        # W_qkv's output width shrinks accordingly.
-        self.W_qkv = nn.Linear(d_model, d_model * 3, bias=False)
+        self.q_dim = d_model  # BEFORE splitting into heads
+        self.q_heads = n_heads
+        self.heads_dim = d_model // n_heads
+
+        if n_kv_heads:
+            # Need to scale down the embedding before splitting, so that when you split
+            # with fewer heads than q, you end up with the same embedding shape
+            self.kv_dim = self.heads_dim * n_kv_heads
+            self.kv_heads = n_kv_heads
+        else:
+            self.kv_dim = self.q_dim
+            self.kv_heads = n_heads
+
+        self.W_qkv = nn.Linear(d_model, self.q_dim + (self.kv_dim * 2), bias=False)
         self.W_o = nn.Linear(d_model, d_model, bias=False)
         self.sdpa = ScaledDotProductAttention()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None, cache=None):
 
-        # TODO(GQA): split q vs k/v unevenly now (q gets d_model, k/v get
-        # n_kv_heads * d_heads each) instead of one even chunk(3, -1).
+        B, S, _ = x.shape
+
         qkv: torch.Tensor = self.W_qkv(x)
-        q, k, v = qkv.chunk(3, -1)
+        q = qkv[:, :, : self.q_dim]
+        k = qkv[:, :, self.q_dim : self.q_dim + self.kv_dim]
+        v = qkv[:, :, self.q_dim + self.kv_dim :]
 
-        # cache should hold the small n_kv_heads K/V, not the expanded ones -
-        # that's where the memory saving comes from. Keep the cache concat
-        # above wherever the expansion step ends up.
-        # TODO(pre-GQA cleanup): cache is tracked pre-reshape (flat (B,S,D))
-        # right now, so every call reshapes the whole concatenated history,
-        # not just the new token. Standard practice (HF past_key_values,
-        # llama.cpp) caches post-reshape, per-head (B,n_heads,S,d_head), so
-        # only the new step's K/V needs reshaping before concat. Fix this
-        # ordering before building GQA on top of it.
+        q = q.view(B, S, self.q_heads, self.q_dim // self.q_heads).transpose(1, 2)
+        k = k.view(B, S, self.kv_heads, self.kv_dim // self.kv_heads).transpose(1, 2)
+        v = v.view(B, S, self.kv_heads, self.kv_dim // self.kv_heads).transpose(1, 2)
+
         if cache is not None:
-            k = torch.cat((cache[0], k), dim=1)
-            v = torch.cat((cache[1], v), dim=1)
+            k = torch.cat((cache[0], k), dim=2)  # concat along the sequence
+            v = torch.cat((cache[1], v), dim=2)
 
-        bq, sq, dq = q.shape
-        bkv, skv, _ = k.shape
+        if q.size(1) != k.size(1):
+            scale_factor = q.size(1) // k.size(1)
+            k_attn = k.repeat_interleave(scale_factor, dim=1)
+            v_attn = v.repeat_interleave(scale_factor, dim=1)
+        else:
+            k_attn, v_attn = k, v
 
-        # Reshape to batchsize, n_heads (another batchsize in this case), S, D
-        q = q.view(bq, sq, self.n_heads, self.d_heads).transpose(1, 2)
-        # TODO(GQA): k/v reshape to n_kv_heads here, then expand
-        # (repeat_interleave) each K/V head across its n_rep query heads
-        # before they hit sdpa.
-        _k = k.view(bkv, skv, self.n_heads, self.d_heads).transpose(1, 2)
-        _v = v.view(bkv, skv, self.n_heads, self.d_heads).transpose(1, 2)
+        context = self.sdpa(q, k_attn, v_attn, mask)
 
-        context = self.sdpa(q, _k, _v, mask)
         # view/reshape merges dims by reading the flat buffer in memory order
         # (rightmost fastest), blind to what the dims mean. Right now memory
         # order is (B, n_heads, S, d_head) - for a fixed seq position, its
@@ -96,7 +96,7 @@ class MultiHeadAttention(nn.Module):
         # head1/seq0. transpose(1, 2) reorders to (B, S, n_heads, d_head) so
         # each position's heads are contiguous before the merge (reshape
         # instead of .contiguous().view(..) since transpose breaks contiguity).
-        context = context.transpose(2, 1).reshape(bq, sq, dq)
+        context = context.transpose(2, 1).reshape(B, S, self.q_dim)
         return self.dropout(self.W_o(context)), k, v
 
 

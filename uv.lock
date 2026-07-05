@@ -1412,7 +1412,7 @@ wheels = [
 [[package]]
 name = "transformer-from-scratch"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "einops" },

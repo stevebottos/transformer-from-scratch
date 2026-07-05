@@ -11,7 +11,7 @@ untrained and fixed either way.
 
 import torch
 
-from src.transformer import DecoderOnlyTransformer
+from transformers_from_scratch.transformer import DecoderOnlyTransformer
 
 VOCAB_SIZE = 100
 MAX_SEQ_LEN = 16

@@ -6,8 +6,8 @@ from pathlib import Path
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
-from src.data import create_dataloaders
-from src.transformer import DecoderOnlyTransformer
+from transformers_from_scratch.data import create_dataloaders
+from transformers_from_scratch.transformer import DecoderOnlyTransformer
 
 CHECKPOINT_DIR = Path("checkpoints")
 

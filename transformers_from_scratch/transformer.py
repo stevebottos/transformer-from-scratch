@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 
-from src.layers import DecoderLayer, NaiveMoEDecoderLayer, LayerOutput, RMSNorm
+from transformers_from_scratch.layers import DecoderLayer, NaiveMoEDecoderLayer, LayerOutput, RMSNorm
 
 
 class DecoderOnlyTransformer(nn.Module):
@@ -45,7 +45,9 @@ class DecoderOnlyTransformer(nn.Module):
         else:
             self.layers = nn.ModuleList(
                 [
-                    NaiveMoEDecoderLayer(d_model, n_heads, n_experts, ff_expansion, dropout)
+                    NaiveMoEDecoderLayer(
+                        d_model, n_heads, n_experts, ff_expansion, dropout
+                    )
                     for _ in range(n_layers)
                 ]
             )

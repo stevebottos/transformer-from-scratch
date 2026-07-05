@@ -7,7 +7,7 @@ position-id plumbing, nothing else in the way.
 
 import torch
 
-from src.attention import MultiHeadAttention
+from transformers_from_scratch.attention import MultiHeadAttention
 
 D_MODEL = 32
 N_HEADS = 4

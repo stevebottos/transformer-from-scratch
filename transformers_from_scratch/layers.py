@@ -3,12 +3,13 @@ Decoder layers: RMSNorm and SwiGLUFeedForward, composed with MultiHeadAttention
 (see attention.py) into full transformer blocks, dense and MoE.
 """
 
+import math
 from dataclasses import dataclass
 
 import torch
 from torch import nn
 
-from src.attention import MultiHeadAttention
+from transformers_from_scratch.attention import MultiHeadAttention
 
 __all__ = [
     "RMSNorm",
@@ -39,15 +40,40 @@ class SwiGLUFeedForward(nn.Module):
     def __init__(self, d_model: int, ff_expansion: int = 4, dropout: float = 0.0):
         super().__init__()
         hidden_dim = d_model * ff_expansion
-        self.W1_plus_gate = nn.Linear(d_model, hidden_dim * 2, bias=False)
+
+        # Fused W1 + gate projection (one wider matmul, not weight tying)
+        self.W1_and_gate = nn.Linear(d_model, hidden_dim * 2, bias=False)
         self.W2 = nn.Linear(hidden_dim, d_model, bias=False)
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        x, gate = self.W1_plus_gate(x).chunk(2, -1)
+        x, gate = self.W1_and_gate(x).chunk(2, -1)
         x = self.act(x) * gate
         x = self.W2(x)
+        return self.dropout(x)
+
+
+class MoESwiGLUFeedForward(nn.Module):
+    """SwiGLU feedforward network: (Swish(xW1) * xV) @ W2."""
+
+    def __init__(
+        self, n_experts, d_model: int, ff_expansion: int = 4, dropout: float = 0.0
+    ):
+        super().__init__()
+        hidden_dim = d_model * ff_expansion
+        self.W1_and_gate = nn.Parameter(torch.empty(n_experts, d_model, hidden_dim * 2))
+        self.W2 = nn.Parameter(torch.empty(n_experts, hidden_dim, d_model))
+        self.act = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+        for e in range(n_experts):
+            nn.init.kaiming_uniform_(self.W1_and_gate[e], a=5**0.5)
+            nn.init.kaiming_uniform_(self.W2[e], a=5**0.5)
+
+    def forward(self, x):
+        x, gate = torch.bmm(x, self.W1_and_gate).chunk(2, -1)
+        x = self.act(x) * gate
+        x = torch.bmm(x, self.W2)
         return self.dropout(x)
 
 
@@ -78,7 +104,7 @@ class DecoderLayer(nn.Module):
         self.norm1 = RMSNorm(d_model)
         self.norm2 = RMSNorm(d_model)
         self.ff = SwiGLUFeedForward(d_model, ff_expansion, dropout)
-        self.attn = MultiHeadAttention(d_model, n_heads, dropout)
+        self.attn = MultiHeadAttention(d_model, n_heads, dropout=dropout)
         self.register_buffer(
             "mask", torch.tril(torch.ones(max_sequence_length, max_sequence_length))
         )
@@ -122,7 +148,7 @@ class NaiveMoEDecoderLayer(nn.Module):
             ]
         )
         self.n_experts = n_experts
-        self.attn = MultiHeadAttention(d_model, n_heads, dropout)
+        self.attn = MultiHeadAttention(d_model, n_heads, dropout=dropout)
         self.register_buffer(
             "mask", torch.tril(torch.ones(max_sequence_length, max_sequence_length))
         )
@@ -189,10 +215,7 @@ class NaiveMoEDecoderLayer(nn.Module):
         if self.training:
             aux_loss = self._aux_loss(logits, expert_indices)
 
-        # TODO: Grouped GEMM dispatch (sort tokens by expert -> contiguous
-        # per-expert chunks -> batched matmul with per-group weights) instead
-        # of a masked python loop. Needed for real vectorized MoE at scale;
-        # masked loop is fine for this repo.
+        # It's better for this to be grouped gemm, will catch that in the more elegant implementation
         residual = x
         out = torch.empty(B, S, D, device=x.device, dtype=x.dtype)
 
@@ -226,10 +249,16 @@ class MoEDecoderLayer(NaiveMoEDecoderLayer):
         super().__init__(
             d_model, n_heads, n_experts, ff_expansion, dropout, max_sequence_length
         )
+        self.ff = MoESwiGLUFeedForward(n_experts, d_model, ff_expansion, dropout)
         self.capacity_factor = capacity_factor
         self.no_expert_sentinel = -1
 
-    def assign_experts_with_overflow(self, B, S, logits):
+    def assign_experts_with_overflow(
+        self,
+        B,
+        S,
+        logits,
+    ):
         expert_indices = torch.argmax(
             logits, dim=-1
         )  # [B, S] - [<batch>, <seq-idx>] = chosen expert for that token
@@ -271,12 +300,12 @@ class MoEDecoderLayer(NaiveMoEDecoderLayer):
         return expert_indices, expert_indices
 
     def forward(self, x, cache=None):
-        B, S, _ = x.shape
-
+        B, S, D = x.shape
         x_out, k, v = self.attn(self.norm1(x), self.mask[:S, :S], cache)
-        x = x + x_out
+        x = x + x_out  # residual
         x_norm = self.norm2(x)
 
+        # Assign experts
         logits = self.router(x_norm)  # [B, S, n_experts]
         expert_indices, raw_experts = self.assign_experts_with_overflow(B, S, logits)
 
@@ -284,20 +313,26 @@ class MoEDecoderLayer(NaiveMoEDecoderLayer):
         if self.training:
             aux_loss = self._aux_loss(logits, raw_experts)
 
-        residual = x
-
-        # This is what allows passthrough - tokens that weren't touched by
-        # an expert are just the original tokens from after attention. Compare with
-        # initializing an empty tensor in the naive implementation - that works there because
-        # we don't drop overflow tokens from the overloaded expert, every token gets processed
-        # here always in that setup
-        # TODO: Make this more efficient with a single batched matmul
-        out = x_norm.clone()
+        # Gather tokens for grouped gemm implementation
+        max_capacity = math.ceil(((B * S) / self.n_experts) * self.capacity_factor)
+        tokens_gathered = torch.zeros((self.n_experts, max_capacity, D))
+        masks = []
         for idx in range(self.n_experts):
-            mask = expert_indices == idx
-            out[mask] = self.ff[idx](x_norm[mask])
+            mask = (
+                expert_indices == idx
+            )  # which tokens in this batch correspond to a certain index. [B, S]
+            tokens = x_norm[mask]  # extract the tokens
+            n_tokens = tokens.size(0)
+            tokens_gathered[idx][:n_tokens] = tokens  # gather them into tokens_gathered
+            masks.append(mask)
 
-        x = out + residual
+        masks = torch.stack(masks)
+        tokens_gathered = self.ff(tokens_gathered)  # [n-experts, max capacity, D]
+        out = x_norm.clone()
+        for idx, mask in enumerate(masks):
+            n_tokens = torch.sum(mask)
+            out[mask] = tokens_gathered[idx][:n_tokens]
+        x = x + out
 
         return LayerOutput(x, k, v, aux_loss)
 
