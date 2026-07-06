@@ -199,6 +199,7 @@ class NaiveMoEDecoderLayer(nn.Module):
         # n_experts scales
         return n_experts * (experts_chosen * probs).sum()
 
+    @torch._dynamo.disable  # boolean-mask dispatch below has data-dependent shapes, unsafe to compile
     def forward(self, x, cache=None):
         B, S, D = x.shape
         x_out, k, v = self.attn(self.norm1(x), self.mask[:S, :S], cache)
@@ -222,7 +223,7 @@ class NaiveMoEDecoderLayer(nn.Module):
         # For every expert, get each point across B,S where we want to use that expert
         for idx in range(self.n_experts):
             mask = expert_indices == idx
-            out[mask] = self.ff[idx](x_norm[mask])
+            out[mask] = self.ff[idx](x_norm[mask]).to(out.dtype)
 
         x = out + residual
 
@@ -299,6 +300,7 @@ class MoEDecoderLayer(NaiveMoEDecoderLayer):
 
         return expert_indices, expert_indices
 
+    @torch._dynamo.disable  # boolean-mask dispatch below has data-dependent shapes, unsafe to compile
     def forward(self, x, cache=None):
         B, S, D = x.shape
         x_out, k, v = self.attn(self.norm1(x), self.mask[:S, :S], cache)
@@ -313,9 +315,12 @@ class MoEDecoderLayer(NaiveMoEDecoderLayer):
         if self.training:
             aux_loss = self._aux_loss(logits, raw_experts)
 
-        # Gather tokens for grouped gemm implementation
+        # Gather tokens for grouped gemm implementation. This is where an all-to-all scatter would
+        # happen in parallel inference/training
         max_capacity = math.ceil(((B * S) / self.n_experts) * self.capacity_factor)
-        tokens_gathered = torch.zeros((self.n_experts, max_capacity, D))
+        tokens_gathered = torch.zeros(
+            (self.n_experts, max_capacity, D), device=x_norm.device, dtype=x_norm.dtype
+        )
         masks = []
         for idx in range(self.n_experts):
             mask = (
@@ -329,9 +334,11 @@ class MoEDecoderLayer(NaiveMoEDecoderLayer):
         masks = torch.stack(masks)
         tokens_gathered = self.ff(tokens_gathered)  # [n-experts, max capacity, D]
         out = x_norm.clone()
+
+        # Gather
         for idx, mask in enumerate(masks):
             n_tokens = torch.sum(mask)
-            out[mask] = tokens_gathered[idx][:n_tokens]
+            out[mask] = tokens_gathered[idx][:n_tokens].to(out.dtype)
         x = x + out
 
         return LayerOutput(x, k, v, aux_loss)
