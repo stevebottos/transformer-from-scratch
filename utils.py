@@ -63,11 +63,14 @@ def generate_sample(
 
 
 @torch.no_grad()
-def evaluate(model, val_loader, device):
-    """Compute average validation loss."""
+def evaluate(model, val_loader, device, max_batches=50):
+    """Average validation loss over at most max_batches batches."""
     model.eval()
     total_loss = 0
+    n_batches = 0
     for x, y in val_loader:
+        if n_batches >= max_batches:
+            break
         x, y = x.to(device), y.to(device)
         with autocast("cuda"):
             logits, _, _ = model(x)
@@ -75,4 +78,5 @@ def evaluate(model, val_loader, device):
                 logits.view(-1, logits.size(-1)), y.view(-1)
             )
         total_loss += loss.item()
-    return total_loss / len(val_loader)
+        n_batches += 1
+    return total_loss / n_batches

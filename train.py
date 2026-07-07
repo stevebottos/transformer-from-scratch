@@ -6,7 +6,7 @@ from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from transformers_from_scratch.data import create_dataloaders
-from utils import CHECKPOINT_DIR, build_model, generate_sample, save_checkpoint
+from utils import CHECKPOINT_DIR, build_model, evaluate, generate_sample, save_checkpoint
 
 
 def train(
@@ -86,13 +86,12 @@ def train(
         pbar.set_postfix(loss=f"{loss.item():.4f}")
         pbar.update(1)
 
-        # if step % eval_interval == 0 and step > 0:
-        #     val_loss = evaluate(model, val_loader, device)
-        #     model.train()
-        #     pbar.set_postfix(loss=f"{loss.item():.4f}", val=f"{val_loss:.4f}")
-        #     if val_loss < best_val_loss:
-        #         best_val_loss = val_loss
-        #         save_checkpoint(model, optimizer, scaler, step, val_loss, config)
+        if step % eval_interval == 0 and step > 0:
+            val_loss = evaluate(model, val_loader, device, max_batches=1000)
+            model.train()
+            tqdm.write(f"[step {step}] val_loss: {val_loss:.4f}")
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
 
         if step % 1000 == 0 and step > 0:
             sample = generate_sample(model, val_loader, tokenizer, device)
@@ -102,9 +101,9 @@ def train(
                 model, optimizer, scaler, max_steps, val_loss, config, ckpt_path
             )
 
-    # val_loss = evaluate(model, val_loader, device)
+    val_loss = evaluate(model, val_loader, device)
     print(f"Final | Val Loss: {val_loss:.4f}")
-    save_checkpoint(model, optimizer, scaler, max_steps, val_loss, config)
+    save_checkpoint(model, optimizer, scaler, max_steps, val_loss, config, ckpt_path)
 
     return model, tokenizer
 

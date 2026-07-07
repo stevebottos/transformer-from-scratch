@@ -67,8 +67,11 @@ class MoESwiGLUFeedForward(nn.Module):
         self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout)
         for e in range(n_experts):
-            nn.init.kaiming_uniform_(self.W1_and_gate[e], a=5**0.5)
-            nn.init.kaiming_uniform_(self.W2[e], a=5**0.5)
+            # .T view: bmm(x, W) contracts over dim 0, but kaiming assumes
+            # nn.Linear's (fan_out, fan_in) layout (dim 0, dim 1) - transpose
+            # so it reads the correct fan_in.
+            nn.init.kaiming_uniform_(self.W1_and_gate[e].T, a=5**0.5)
+            nn.init.kaiming_uniform_(self.W2[e].T, a=5**0.5)
 
     def forward(self, x):
         x, gate = torch.bmm(x, self.W1_and_gate).chunk(2, -1)
@@ -252,55 +255,7 @@ class MoEDecoderLayer(NaiveMoEDecoderLayer):
         )
         self.ff = MoESwiGLUFeedForward(n_experts, d_model, ff_expansion, dropout)
         self.capacity_factor = capacity_factor
-        self.no_expert_sentinel = -1
 
-    def assign_experts_with_overflow(
-        self,
-        B,
-        S,
-        logits,
-    ):
-        expert_indices = torch.argmax(
-            logits, dim=-1
-        )  # [B, S] - [<batch>, <seq-idx>] = chosen expert for that token
-        fair_capacity = (B * S) / self.n_experts
-
-        counts = torch.bincount(expert_indices.flatten(), minlength=self.n_experts)
-        expert_over_share = (counts / fair_capacity) > self.capacity_factor
-
-        if any(expert_over_share):
-            expert_probs = torch.max(
-                torch.nn.functional.softmax(logits, dim=-1), dim=-1
-            )
-            raw_experts = expert_indices.clone()
-            for idx, is_over in enumerate(expert_over_share):
-                if not is_over:
-                    continue
-
-                # Now we mask per the index, inverse probs, since we want top-k
-                # to return the lowest probs
-                masked = 1 - expert_probs.values.clone()
-                masked[expert_probs.indices != idx] = float(
-                    "-inf"
-                )  # so they never appear in the top-k
-
-                masked = masked.view(
-                    B * S
-                )  # flattening just using view to make it obvious, since I'm using view again later
-
-                trim_num = int(counts[idx] - (fair_capacity * self.capacity_factor))
-                trim = torch.topk(masked, k=int(trim_num))
-                masked[trim.indices] = self.no_expert_sentinel
-                masked = masked.view(B, S)
-                expert_indices[masked == self.no_expert_sentinel] = (
-                    self.no_expert_sentinel
-                )
-
-            return expert_indices, raw_experts
-
-        return expert_indices, expert_indices
-
-    @torch._dynamo.disable  # boolean-mask dispatch below has data-dependent shapes, unsafe to compile
     def forward(self, x, cache=None):
         B, S, D = x.shape
         x_out, k, v = self.attn(self.norm1(x), self.mask[:S, :S], cache)
@@ -309,36 +264,58 @@ class MoEDecoderLayer(NaiveMoEDecoderLayer):
 
         # Assign experts
         logits = self.router(x_norm)  # [B, S, n_experts]
-        expert_indices, raw_experts = self.assign_experts_with_overflow(B, S, logits)
+
+        raw_experts = torch.argmax(
+            logits, dim=-1
+        )  # [B, S] - [<batch>, <seq-idx>] = chosen expert for that token
 
         aux_loss = None
         if self.training:
             aux_loss = self._aux_loss(logits, raw_experts)
 
-        # Gather tokens for grouped gemm implementation. This is where an all-to-all scatter would
-        # happen in parallel inference/training
+        #
+        # Gathering tokens process
+        #
+        probs = torch.max(torch.nn.functional.softmax(logits, dim=-1), dim=-1)
         max_capacity = math.ceil(((B * S) / self.n_experts) * self.capacity_factor)
+
+        # This gets filled up
         tokens_gathered = torch.zeros(
             (self.n_experts, max_capacity, D), device=x_norm.device, dtype=x_norm.dtype
         )
-        masks = []
-        for idx in range(self.n_experts):
-            mask = (
-                expert_indices == idx
-            )  # which tokens in this batch correspond to a certain index. [B, S]
-            tokens = x_norm[mask]  # extract the tokens
-            n_tokens = tokens.size(0)
-            tokens_gathered[idx][:n_tokens] = tokens  # gather them into tokens_gathered
-            masks.append(mask)
 
-        masks = torch.stack(masks)
+        # Makes things easier to work with flattened
+        probs_indices = probs.indices.view(B * S)
+        probs_values = probs.values.view(B * S)
+        x_norm = x_norm.view(B * S, D)
+
+        all_indices = []
+        for expert_idx in range(self.n_experts):
+            masked_vals = probs_values.clone()
+            masked_vals[probs_indices != expert_idx] = float("-inf")
+            topk = torch.topk(masked_vals, max_capacity)
+
+            # NOTE: This was my initial intuition, but it prevents compilation because
+            # we're slicing the shape of the topk_indices tensor.
+            # Keeping it in so I don't forget
+            # topk_indices = topk.indices[topk.values >= 0.0]
+            # tokens = x_norm[topk_indices]
+            # tokens_gathered[expert_idx, : len(tokens)] = tokens
+
+            # What we want is this - just accept the incorrect tokens before zeroing them out
+            valid = (topk.values >= 0.0).unsqueeze(-1)
+            tokens = x_norm[topk.indices]
+            tokens_gathered[expert_idx] = tokens * valid
+            all_indices.append(topk.indices)
+
         tokens_gathered = self.ff(tokens_gathered)  # [n-experts, max capacity, D]
-        out = x_norm.clone()
 
-        # Gather
-        for idx, mask in enumerate(masks):
-            n_tokens = torch.sum(mask)
-            out[mask] = tokens_gathered[idx][:n_tokens].to(out.dtype)
+        # NOTE: This method only works because we're not using bias! Inputs in self.ff that are 0
+        # always come out as zero
+        out_flat = torch.zeros_like(x_norm)
+        for expert_idx in range(self.n_experts):
+            out_flat.index_add_(0, all_indices[expert_idx], tokens_gathered[expert_idx])
+        out = out_flat.reshape(B, S, D)
         x = x + out
 
         return LayerOutput(x, k, v, aux_loss)
